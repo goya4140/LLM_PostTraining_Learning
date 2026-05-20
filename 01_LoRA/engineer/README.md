@@ -7,6 +7,7 @@
 
 ## 目录
 
+0. [极简 Demo（核心调用逻辑一览）](#0-极简-demo核心调用逻辑一览)
 1. [PEFT 库快速上手](#1-peft-库快速上手)
 2. [TRL SFTTrainer 参数详解](#2-trl-sfttrainer-参数详解)
 3. [精度与 dtype 选择](#3-精度与-dtype-选择)
@@ -15,6 +16,149 @@
 6. [W\&B 监控设置](#6-wb-监控设置)
 7. [Quick Start](#7-quick-start)
 8. [常见报错与修复](#8-常见报错与修复)
+
+---
+
+## 0. 极简 Demo（核心调用逻辑一览）
+
+> 以下代码**不追求严谨性**，只用于快速理解核心调用逻辑。  
+> 生产级实现见 `train.py`、`dataset.py`、`config.py`。
+
+### 0.1 完整训练流程（~30 行）
+
+```python
+# 极简 LoRA 训练 Demo（仅展示核心逻辑，非生产代码）
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model
+from trl import SFTTrainer, SFTConfig
+from datasets import load_dataset
+
+# 1. 加载基座模型（BF16 存储，自动分配到 GPU）
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-7B-Instruct",
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+
+# 2. 注入 LoRA —— 冻结基座权重，只新增 A、B 两个小矩阵
+lora_config = LoraConfig(
+    r=16,                   # 秩：A(r×k) 和 B(d×r) 的公共维度
+    lora_alpha=32,          # 缩放系数：实际更新量 = ΔW × (alpha/r) = ΔW × 2
+    target_modules=["q_proj", "v_proj"],  # 只在注意力 Q/V 上加 LoRA
+    lora_dropout=0.05,
+)
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+# 输出示例：trainable params: 20,971,520 || all params: 7,241,748,480 || trainable%: 0.2896
+
+# 3. 准备数据集（Alpaca 格式：instruction + output 字段）
+dataset = load_dataset("tatsu-lab/alpaca", split="train[:2000]")
+
+def formatting_func(examples):
+    """将数据集样本拼成完整对话字符串，SFTTrainer 自动做 label mask"""
+    texts = []
+    for inst, out in zip(examples["instruction"], examples["output"]):
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": inst},
+             {"role": "assistant", "content": out}],
+            tokenize=False, add_generation_prompt=False,
+        )
+        texts.append(text)
+    return texts
+
+# 4. 用 SFTTrainer 训练（内部自动处理 label mask、梯度累积等）
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=dataset,
+    args=SFTConfig(
+        output_dir="./output",
+        max_steps=200,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=8,  # 有效 batch = 32
+        bf16=True,
+        max_seq_length=1024,
+    ),
+    formatting_func=formatting_func,
+)
+trainer.train()
+
+# 5. 只保存 LoRA 权重（~100MB，而非完整模型的 ~14GB）
+model.save_pretrained("./lora_adapter")
+tokenizer.save_pretrained("./lora_adapter")
+```
+
+### 0.2 加载 Adapter 并推理（~10 行）
+
+```python
+# 极简推理 Demo
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+base = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-7B-Instruct", torch_dtype=torch.bfloat16, device_map="auto"
+)
+
+# 方式 A：合并后推理（adapter 权重融入基座，推理零延迟）
+model = PeftModel.from_pretrained(base, "./lora_adapter").merge_and_unload()
+
+# 方式 B：不合并（保留切换能力，forward 时多一次矩阵乘）
+# model = PeftModel.from_pretrained(base, "./lora_adapter")
+
+inputs = tokenizer.apply_chat_template(
+    [{"role": "user", "content": "什么是 LoRA？"}],
+    return_tensors="pt", add_generation_prompt=True,
+).to("cuda")
+print(tokenizer.decode(model.generate(inputs, max_new_tokens=200)[0]))
+```
+
+### 0.3 QLoRA 变体（显存极度受限时）
+
+```python
+# QLoRA = NF4 4-bit 量化基座 + 正常精度 LoRA
+# 效果：显存从 ~14GB 降至 ~5GB，精度损失 < 2%
+from transformers import BitsAndBytesConfig
+from peft import prepare_model_for_kbit_training
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",           # NF4 量化（比 int4 更精确）
+    bnb_4bit_compute_dtype=torch.bfloat16,  # 计算时反量化为 BF16
+    bnb_4bit_use_double_quant=True,      # 再省 ~0.4 bit/param
+)
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-7B-Instruct",
+    quantization_config=bnb_config,
+    device_map="auto",
+)
+model = prepare_model_for_kbit_training(model)  # 启用 4-bit 模型的梯度传播
+
+# 之后的 LoRA 注入和 SFTTrainer 训练步骤与 0.1 节完全相同
+model = get_peft_model(model, lora_config)
+trainer = SFTTrainer(model=model, ...)
+trainer.train()
+```
+
+### 关键调用关系总结
+
+```
+基座模型（frozen）
+    │
+    ▼  get_peft_model(model, LoraConfig)
+注入 LoRA（新增 A、B，冻结原有权重）
+    │
+    ▼  SFTTrainer(model, dataset, formatting_func)
+训练循环（自动：label mask / 梯度累积 / BF16 / 保存）
+    │
+    ▼  model.save_pretrained()
+仅保存 A、B 矩阵（~100MB adapter）
+    │
+    ▼  PeftModel.from_pretrained().merge_and_unload()
+合并回基座，恢复标准模型（零推理开销）
+```
 
 ---
 
