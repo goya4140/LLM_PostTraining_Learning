@@ -1,0 +1,42 @@
+# ============================================================
+# LLM_PostTraining_Learning — 本地环境（Mac M4 Pro）
+# Python 3.11，MPS 加速（Apple Silicon）
+#
+# 安装步骤：
+#   python -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements_local.txt
+#
+# 注意：bitsandbytes 在 Apple Silicon 上支持有限（仅权重加载量化）
+# ============================================================
+
+# PyTorch 生态（MPS 后端，Apple Silicon）
+torch>=2.5.1
+torchvision>=0.20.1
+
+# HuggingFace 生态
+transformers>=4.46.0,<5.0
+datasets>=3.0.0,<4.0
+tokenizers>=0.20.0
+acceleate>=1.1.0,<2.0
+peft>=0.13.0,<1.0
+trl>=0.12.0,<1.0
+
+# 量化（4-bit 权重加载，MPS 推理）
+bitsandbytes>=0.44.0
+
+# 数据处理
+numpy>=1.26.0,<2.0
+pandas>=2.0.0
+scipy>=1.11.0
+
+# 可视化与日志
+matplotlib>=3.8.0,<4.0
+tqdm>=4.66.0
+tensorboard>=2.15.0
+
+# 工具
+huggingface_hub>=0.25.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+evaluate>=0.4.0
